@@ -1,0 +1,79 @@
+# Parameters for our own EKF (ekf_node) and the ground-truth publisher.
+# Used by launch/task1a.launch.py and by `run_offline --params`.
+#
+# Units: sigma_* are standard deviations (m, m/s, rad, rad/s).
+#        q_* are process-noise INTENSITIES: the variance added per second of
+#        prediction (Q = diag(q) * dt), so they do not depend on message rate.
+#
+# How to estimate the sensor sigmas: the robot stands still at the start of the
+# bag, so the spread of the readings there is pure sensor noise:
+#   ros2 run my_ekf_pkg run_offline <bag> --noise-window 3.0
+# prints mean/std of imu angular_velocity.z and odom twist v / omega over the
+# first 3 s (check that the robot is really stationary in that window).
+# The std of the IMU rate -> sigma_imu_omega, of the odom speed -> sigma_odom_v.
+# Note: while stationary, wheel odometry often reports exactly 0, so its std
+# underestimates the noise while driving (wheel slip, quantisation) - keep a
+# floor of ~0.01-0.02 m/s.
+
+ekf_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # Which measurements are fused
+    use_odom_v: true          # odom twist.twist.linear.x -> v
+    use_odom_omega: false     # odom twist.twist.angular.z -> omega (IMU is better)
+    use_imu: true             # imu angular_velocity.z -> omega
+    use_gt: true              # 1 Hz ground-truth pose correction
+
+    # Measurement noise
+    sigma_odom_v: 0.02        # m/s
+    sigma_odom_omega: 0.05    # rad/s
+    sigma_imu_omega: 0.02     # rad/s
+    gt_use_msg_covariance: true   # use the covariance in /gt/pose_1hz if valid
+    sigma_gt_xy: 0.01         # m    (fallback if the message covariance is invalid)
+    sigma_gt_yaw: 0.0175      # rad  (~1 deg)
+
+    # Process noise intensities (variance growth per second)
+    q_xy: 1.0e-4              # m^2/s     - unmodelled slip / lateral motion
+    q_theta: 1.0e-4           # rad^2/s   - unmodelled heading changes
+    q_v: 0.25                 # (m/s)^2/s - how fast the speed can change (accel.)
+    q_omega: 1.0              # (rad/s)^2/s - how fast the yaw rate can change
+
+    # Initial uncertainty (the odom frame starts at the robot, so pose ~known)
+    init_sigma_xy: 0.01
+    init_sigma_theta: 0.01
+    init_sigma_v: 0.1
+    init_sigma_omega: 0.1
+
+    # Numerics / time handling
+    max_step: 0.02            # s, longest prediction sub-step
+    time_jump_reset: 1.0      # s, a sensor's stamps jumping back more than this resets
+
+    # Topics / frames / output
+    odom_topic: /odom
+    imu_topic: /imu
+    gt_topic: /gt/pose_1hz
+    output_topic: /ekf/odom
+    path_topic: /ekf/path
+    frame_id: odom
+    child_frame_id: base_footprint
+    path_period: 0.1          # s between poses in /ekf/path
+    eval_csv: ~/ros2_ws/ekf_evaluation.csv
+
+gt_publisher:
+  ros__parameters:
+    use_sim_time: true
+    mocap_frame: mocap
+    gt_frame: mocap_laser_link   # the mocap tracks the laser (base_scan)
+    target_frame: odom
+    sensor_offset_x: -0.064      # base_scan position in base_footprint (waffle_pi)
+    sensor_offset_y: 0.0
+    rate_hz: 1.0                 # rate of /gt/pose_1hz
+    sigma_xy: 0.01               # m, covariance attached to /gt/pose_1hz
+    sigma_yaw: 0.0175            # rad
+    path_period: 0.1
+    time_jump_reset: 1.0
+    tf_topic: /tf
+    full_topic: /gt/pose_full
+    rate_topic: /gt/pose_1hz
+    path_topic: /gt/path

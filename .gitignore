@@ -5,3 +5,9 @@ build/
 install/
 log/
 *.csv
+
+# Generated results (recorded bags, evaluation plots)
+task1a_results*/
+*_eval/
+offline_eval/
+*.png

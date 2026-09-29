@@ -1,149 +1,196 @@
+"""
+ROS 2 node running our own EKF (Task 1a).
+
+Subscribes to wheel odometry (/odom), the IMU (/imu) and the 1 Hz ground
+truth (/gt/pose_1hz, from gt_publisher) and publishes the estimate as
+nav_msgs/Odometry on /ekf/odom plus a nav_msgs/Path on /ekf/path, both in
+frame ``odom``. It does NOT broadcast TF (the bag already contains
+odom -> base_footprint).
+
+All timing uses message header stamps; run with use_sim_time:=true.
+"""
+
 import csv
+from dataclasses import fields
 import os
 
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from my_ekf_pkg.fusion import CSV_HEADER, EkfFusion, FusionConfig
+from my_ekf_pkg.geometry import quaternion_from_yaw
+from my_ekf_pkg.msg_utils import (cov3_from_cov6, cov6_from_cov3, pose2d_from_pose,
+                                  sec_to_stamp_fields, stamp_to_sec, twist_cov6)
+from nav_msgs.msg import Odometry, Path
+from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
-from nav_msgs.msg import Odometry
-from tf_transformations import euler_from_quaternion
-import numpy as np
-from my_ekf_pkg.ekf import EKF
 
-class EKFNode(Node):
+# Node parameters that are not part of FusionConfig
+NODE_PARAMS = {
+    'odom_topic': '/odom',
+    'imu_topic': '/imu',
+    'gt_topic': '/gt/pose_1hz',
+    'output_topic': '/ekf/odom',
+    'path_topic': '/ekf/path',
+    'frame_id': 'odom',
+    'child_frame_id': 'base_footprint',
+    'path_period': 0.1,
+    'eval_csv': '~/ros2_ws/ekf_evaluation.csv',
+}
+
+
+class EkfNode(Node):
+    """Thin ROS wrapper around EkfFusion."""
+
     def __init__(self):
-        super().__init__("ekf_node")
+        """Declare parameters, create the filter, publishers and subscribers."""
+        super().__init__('ekf_node')
 
-        #Initialise state vector [x, y, theta] and covariance matrix P
-        self.x = np.zeros((3))
-        self.P = np.eye(3) * 0.1
+        # dynamic_typing lets the YAML contain 1 instead of 1.0 (we cast below)
+        any_type = ParameterDescriptor(dynamic_typing=True)
+        defaults = FusionConfig()
+        for f in fields(FusionConfig):
+            self.declare_parameter(f.name, getattr(defaults, f.name), any_type)
+        for name, value in NODE_PARAMS.items():
+            self.declare_parameter(name, value, any_type)
 
-        #Noise matrices for process and measurement noise
-        #The numbers are placeholders and need to be tuned
-        self.Q = np.diag([0.02, 0.02, 0.01])
-        self.R = np.diag([0.001, 0.001, 0.001])
+        config = FusionConfig.from_dict(
+            {f.name: self.get_parameter(f.name).value for f in fields(FusionConfig)})
+        self.fusion = EkfFusion(config)
+        p = {name: self.get_parameter(name).value for name in NODE_PARAMS}
+        self.frame_id = str(p['frame_id'])
+        self.child_frame_id = str(p['child_frame_id'])
+        self.path_period = float(p['path_period'])
+        self.eval_csv = os.path.expanduser(str(p['eval_csv']))
 
-        self.ekf = EKF(self.x, self.P, self.Q, self.R)
+        self.path = Path()
+        self.path.header.frame_id = self.frame_id
+        self.last_path_time = None
+        self.n_resets_seen = 0
+        self.lag_warned = False
 
-        #Store last received velocity and angular velocity
-        self.last_v = 0.0
-        self.last_omega = 0.0
+        self.odom_pub = self.create_publisher(Odometry, str(p['output_topic']), 10)
+        self.path_pub = self.create_publisher(Path, str(p['path_topic']), 10)
+        self.create_subscription(Odometry, str(p['odom_topic']), self.odom_callback,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Imu, str(p['imu_topic']), self.imu_callback,
+                                 qos_profile_sensor_data)
+        self.create_subscription(PoseWithCovarianceStamped, str(p['gt_topic']),
+                                 self.gt_callback, 10)
 
-        #Store last time for prediction and last time for ground truth update
-        self.last_time = None
-        self.last_gt_time = None
-        #Minimum time between ground truth updates in seconds (1.0 sec = 1 Hz)
-        self.gt_period = 1.0
+        self.get_logger().info(
+            'EKF node started with parameters: '
+            + ', '.join(f'{k}={v}' for k, v in config.to_dict().items()))
 
-        #Store evaluation data
-        self.eval_data = []
+    # -------------------------------------------------------------- callbacks
+    def odom_callback(self, msg):
+        """Fuse forward speed (and optionally yaw rate) from wheel odometry."""
+        self.fusion.on_odom(stamp_to_sec(msg.header.stamp),
+                            msg.twist.twist.linear.x, msg.twist.twist.angular.z)
+        self.after_measurement()
 
-        #Create subscriptions for odometry, IMU, and ground truth data
-        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.create_subscription(Imu, '/imu', self.imu_callback, 10)
-        self.create_subscription(Odometry, '/ground_truth', self.gt_callback, 10)
+    def imu_callback(self, msg):
+        """Fuse the gyroscope yaw rate."""
+        self.fusion.on_imu(stamp_to_sec(msg.header.stamp), msg.angular_velocity.z)
+        self.after_measurement()
 
-        #Create publisher for estimated state
-        self.ekf_pub = self.create_publisher(Odometry, '/ekf/odom', 10)
+    def gt_callback(self, msg):
+        """Record the pre-update error and (if use_gt) correct with the 1 Hz GT."""
+        record = self.fusion.on_gt(stamp_to_sec(msg.header.stamp),
+                                   pose2d_from_pose(msg.pose.pose),
+                                   cov3_from_cov6(msg.pose.covariance))
+        self.get_logger().debug(
+            f'GT t={record.time:.2f}: err={record.error_dist:.3f} m, '
+            f'sigma={record.sigma_pos:.3f} m, NIS={record.nis:.2f}')
+        self.after_measurement()
 
-        #Log that the EKF node started
-        self.get_logger().info("EKF Node has been started.")
+    # ------------------------------------------------------------- publishing
+    def after_measurement(self):
+        """Handle resets/diagnostics and publish the current estimate."""
+        if self.fusion.n_resets != self.n_resets_seen:
+            self.n_resets_seen = self.fusion.n_resets
+            self.get_logger().warn('Time jumped back (bag restarted?): EKF reset.')
+            self.path.poses = []
+            self.last_path_time = None
+        if not self.lag_warned and self.fusion.max_lag > self.fusion.config.time_jump_reset:
+            self.lag_warned = True
+            self.get_logger().warn(
+                f'Messages arrive up to {self.fusion.max_lag:.2f} s older than the filter '
+                'time; the sensors may be stamped by unsynchronised clocks.')
+        self.publish_estimate()
 
-    #Combine sec and nanosec fields of ROS timestamps into one float (in sec)
-    def stamp_to_sec(self, stamp):
-        return stamp.sec + stamp.nanosec * 1e-9
+    def make_stamp(self):
+        """Return the filter time as a builtin_interfaces/Time."""
+        sec, nanosec = sec_to_stamp_fields(self.fusion.time)
+        return Time(sec=sec, nanosec=nanosec)
 
-    #Run the prediction step of the EKF using the last received velocity and angular velocity
-    def run_predict(self, stamp):
-        t = self.stamp_to_sec(stamp)
+    def publish_estimate(self):
+        """Publish /ekf/odom and (every path_period) /ekf/path."""
+        x, P = self.fusion.state, self.fusion.covariance
+        stamp = self.make_stamp()
+        qx, qy, qz, qw = quaternion_from_yaw(float(x[2]))
 
-        if self.last_time is None:
-            self.last_time = t
-            return
-
-        dt = t - self.last_time
-        if dt <= 0.0 or dt > 1.0:
-            self.last_time = t
-            return
-
-        self.ekf.predict(self.last_v, self.last_omega, dt)
-        self.last_time = t
-
-        self.publish_estimate(stamp)
-
-    #Callback for odometry messages, updates the last received linear velocity and runs the prediction step
-    def odom_callback(self, msg: Odometry):
-        self.last_v = msg.twist.twist.linear.x
-        self.run_predict(msg.header.stamp)
-
-    #Callback for IMU messages, updates the last received angular velocity and runs the prediction step
-    def imu_callback(self, msg: Imu):
-        self.last_omega = msg.angular_velocity.z
-        self.run_predict(msg.header.stamp)
-
-    #Callback for ground truth messages, updates the EKF with the ground truth position and orientation if enough time has passed since the last update
-    def gt_callback(self, msg: Odometry):
-        t = self.stamp_to_sec(msg.header.stamp)
-
-        #Downsample ground truth to 1 Hz
-        if self.last_gt_time is not None and (t - self.last_gt_time) < self.gt_period:
-            return
-
-        q = msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-
-        z = np.array([msg.pose.pose.position.x,
-                      msg.pose.pose.position.y,
-                      yaw])
-
-        #Error calculation before measurement update
-        err_x = self.ekf.x[0] - z[0]
-        err_y = self.ekf.x[1] - z[1]
-        err_dist = np.sqrt(err_x**2 + err_y**2)
-        err_theta = self.ekf.normalize_angle(self.ekf.x[2] - z[2])
-
-        self.eval_data.append([t, err_dist, err_x, err_y, err_theta])
-        
-        self.ekf.update(z)
-        self.last_gt_time = t
-        self.publish_estimate(msg.header.stamp)
-
-    #Publish the current state estimate as an Odometry message
-    def publish_estimate(self, stamp):
         out = Odometry()
         out.header.stamp = stamp
-        out.header.frame_id = "map"
-        out.pose.pose.position.x = float(self.ekf.x[0])
-        out.pose.pose.position.y = float(self.ekf.x[1])
+        out.header.frame_id = self.frame_id
+        out.child_frame_id = self.child_frame_id
+        out.pose.pose.position.x = float(x[0])
+        out.pose.pose.position.y = float(x[1])
+        out.pose.pose.orientation.x = qx
+        out.pose.pose.orientation.y = qy
+        out.pose.pose.orientation.z = qz
+        out.pose.pose.orientation.w = qw
+        out.pose.covariance = cov6_from_cov3(P[:3, :3])
+        # twist is expressed in child_frame_id (robot frame): vx = v, wz = omega
+        out.twist.twist.linear.x = float(x[3])
+        out.twist.twist.angular.z = float(x[4])
+        out.twist.covariance = twist_cov6(P[3, 3], P[4, 4], P[3, 4])
+        self.odom_pub.publish(out)
 
-        theta = float(self.ekf.x[2])
-        out.pose.pose.orientation.z = np.sin(theta / 2.0)
-        out.pose.pose.orientation.w = np.cos(theta / 2.0)
+        t = self.fusion.time
+        if self.last_path_time is None or t - self.last_path_time >= self.path_period:
+            self.last_path_time = t
+            pose = PoseStamped()
+            pose.header = out.header
+            pose.pose = out.pose.pose
+            self.path.header.stamp = stamp
+            self.path.poses.append(pose)
+            self.path_pub.publish(self.path)
 
-        self.ekf_pub.publish(out)
-
+    # ------------------------------------------------------------- evaluation
     def save_evaluation_csv(self):
-        if not self.eval_data:
+        """Write the pre-update errors at the GT instants (plot_results.py format)."""
+        log = self.fusion.gt_log
+        if not log:
+            self.get_logger().warn('No ground-truth messages received; no CSV written.')
             return
-        
-        file_path = os.path.expanduser("~/ros2_ws/ekf_evaluation.csv")
-        with open(file_path, 'w', newline='') as f:
+        directory = os.path.dirname(self.eval_csv)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.eval_csv, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['time', 'error_dist', 'err_x', 'err_y', 'err_yaw'])
-            writer.writerows(self.eval_data)
-        self.get_logger().info(f"Evaluation data saved to {file_path}")
+            writer.writerow(CSV_HEADER)
+            writer.writerows(r.as_row() for r in log)
+        self.get_logger().info(f'Evaluation data ({len(log)} rows) saved to {self.eval_csv}')
 
 
 def main(args=None):
+    """Run the EKF node until Ctrl+C, then write the evaluation CSV."""
     rclpy.init(args=args)
-    node = EKFNode()
+    node = EkfNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.save_evaluation_csv()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

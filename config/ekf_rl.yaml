@@ -1,0 +1,85 @@
+# robot_localization EKF configurations, with the SAME inputs as our EKF for a
+# fair comparison:
+#   odom0: /odom  -> vx, vy (vy = 0 for a differential drive, a useful constraint)
+#   imu0:  /imu   -> vyaw only (no orientation, no accelerations)
+#   pose0: /gt/pose_1hz -> x, y, yaw (only in ekf_rl_gt)
+# The yaw rate comes from ONE source (the IMU) only.
+#
+# Notes on robot_localization behaviour:
+# - measurement variances below 1e-9 are clamped, so a zero covariance in a
+#   message means "perfect measurement"; check the covariances in /odom, /imu.
+# - process_noise_covariance is multiplied by dt (not set here -> defaults).
+# - it subscribes with SensorDataQoS (best effort).
+#
+# Config vector order: [x, y, z, roll, pitch, yaw,
+#                       vx, vy, vz, vroll, vpitch, vyaw,
+#                       ax, ay, az]
+
+ekf_rl_no_gt:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 50.0
+    sensor_timeout: 0.1
+    two_d_mode: true
+    publish_tf: false
+    publish_acceleration: false
+    reset_on_time_jump: true
+    print_diagnostics: true
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_footprint
+    world_frame: odom
+    use_control: false
+    odom0: /odom
+    odom0_config: [false, false, false,  false, false, false,
+                   true,  true,  false,  false, false, false,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+    imu0: /imu
+    imu0_config: [false, false, false,  false, false, false,
+                  false, false, false,  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 20
+    imu0_remove_gravitational_acceleration: true
+
+ekf_rl_gt:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 50.0
+    sensor_timeout: 0.1
+    two_d_mode: true
+    publish_tf: false
+    publish_acceleration: false
+    reset_on_time_jump: true
+    print_diagnostics: true
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_footprint
+    world_frame: odom
+    use_control: false
+    odom0: /odom
+    odom0_config: [false, false, false,  false, false, false,
+                   true,  true,  false,  false, false, false,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+    imu0: /imu
+    imu0_config: [false, false, false,  false, false, false,
+                  false, false, false,  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 20
+    imu0_remove_gravitational_acceleration: true
+    pose0: /gt/pose_1hz
+    pose0_config: [true,  true,  false,  false, false, true,
+                   false, false, false,  false, false, false,
+                   false, false, false]
+    pose0_differential: false
+    pose0_relative: false
+    pose0_queue_size: 5
